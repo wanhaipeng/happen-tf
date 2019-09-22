@@ -6,6 +6,7 @@ import math
 import numpy as np
 import tensorflow as tf
 from tensorflow.examples.tutorials.mnist import input_data
+from tensorflow.python.framework import graph_util
 
 FLAGS = tf.app.flags.FLAGS
 tf.app.flags.DEFINE_string('mode', '', 'program mode')
@@ -74,7 +75,7 @@ def conv_graph(data, keep=1.0):
         # Create variable named "biases".
         biases = tf.get_variable("biases", shape[-1:],
             initializer=tf.constant_initializer(0.1))
-        return tf.matmul(input, weights) + biases
+        return tf.nn.bias_add(tf.matmul(input, weights), biases)
     # definition pooling layer
     def pooling(input, stride, kernel_shape):
         pool = tf.nn.max_pool(input, kernel_shape, stride, padding='SAME')
@@ -91,9 +92,9 @@ def conv_graph(data, keep=1.0):
         pool1 = tf.reshape(pool1, [-1,1024])
     with tf.variable_scope("fc1"):
         fc1 = fc(pool1, [1024,512])
-        dropout1 = tf.nn.dropout(fc1, keep)
-    with tf.variable_scope("fc2"):
-        fc2 = fc(dropout1, [512,10])
+        # dropout1 = tf.nn.dropout(fc1, keep)
+    with tf.variable_scope("fc2"): 
+        fc2 = fc(fc1, [512,10])
     with tf.variable_scope("softmax1"):
         output = tf.nn.softmax(fc2)
     return output
@@ -111,11 +112,11 @@ def train(dataset_path):
     graph1 = tf.Graph()
     with graph1.as_default():
         # x,y_,lr,keep_prob placeholder
-        x = tf.placeholder(tf.float32, [None, 784], name='input')
-        y_ = tf.placeholder(tf.float32, [None, 10], name='label')
+        x = tf.placeholder(tf.float32, [None, 784], name='input_image')
+        y_ = tf.placeholder(tf.float32, [None, 10], name='input_label')
         lr = tf.placeholder(tf.float32, name='lr')
         keep_prob = tf.placeholder(tf.float32)
-        x_reshape = tf.reshape(x, [-1, 28, 28, 1])
+        x_reshape = tf.reshape(x, [-1, 28, 28, 1], name="image/reshape")
         y = conv_graph(x_reshape, keep_prob)
         # train 
         cross_entropy = -tf.reduce_sum(y_ * tf.log(y))
@@ -160,8 +161,8 @@ def test(dataset_path):
     # create graph
     graph1 = tf.Graph()
     with graph1.as_default():
-        x = tf.placeholder(tf.float32, [1, 784], name="input")
-        x_reshape = tf.reshape(x, [-1, 28, 28, 1])
+        x = tf.placeholder(tf.float32, [1, 784], name="input_image")
+        x_reshape = tf.reshape(x, [-1, 28, 28, 1], name="image/reshape")
         y = conv_graph(x_reshape)
         saver = tf.train.Saver()
     # load data
@@ -174,6 +175,9 @@ def test(dataset_path):
         out = sess.run(y, feed_dict={x: test_mnist})
         print("test : {}".format(np.argmax(out.flatten(), 0)))
         print("real : {}".format(np.argmax(test_mnist_label, 0)))
+    # list graph op name
+    for op in graph1.get_operations():
+        print(op.name, op.type)
 
 def frozen(dataset_path):
     """ Train mnist dataset
@@ -183,7 +187,68 @@ def frozen(dataset_path):
     dataset_path : str
         input mnist dataset path
     """
-    pass
+    # retrieve checkpoint fullpath
+    checkpoint = tf.train.get_checkpoint_state(dataset_path)
+    input_checkpoint = checkpoint.model_checkpoint_path
+    # precise the file fullname of freezed graph
+    absolute_model_folder = "/".join(input_checkpoint.split('/')[:-1])
+    output_graph = absolute_model_folder + "/frozen_model.pb"
+    # print(absolute_model_folder)
+    # freeze之前必须明确哪个是输出结点,也就是我们要得到推论结果的结点
+    # 输出结点可以看我们模型的定义
+    # 只有定义了输出结点,freeze才会把得到输出结点所必要的结点都保存下来,或者哪些结点可以丢弃
+    # 所以,output_node_names必须根据不同的网络进行修改
+    output_node_names = "softmax1/Softmax"
+    # We clear the devices, to allow TensorFlow to control on the
+    # loading where it wants operations to be calculated
+    clear_devices = True
+    # import meta graph
+    saver = tf.train.import_meta_graph(input_checkpoint + '.meta', clear_devices=clear_devices)
+    # retrieve pb graph definition
+    graph = tf.get_default_graph()
+    input_graph_def = graph.as_graph_def()
+    # 已经将训练好的参数加载进来,也即最后保存的模型是有图有参数的,所以才叫做是frozen
+    # 相当于将参数已经固化在了图当中
+    with tf.Session() as sess:
+        saver.restore(sess, input_checkpoint)
+        # use built-in TF helper to export variable to constant
+        output_graph_def = graph_util.convert_variables_to_constants(
+            sess,
+            input_graph_def,
+            output_node_names.split(","))
+        with tf.gfile.GFile(output_graph, "wb") as f:
+            f.write(output_graph_def.SerializeToString())
+        print("{} ops in the final graph.".format(len(output_graph_def.node)))
+
+def test_frozen(dataset_path):
+    """ Train mnist dataset
+
+    Parameters
+    ----------
+    dataset_path : str
+    """
+    # load freeze model
+    model_path = os.path.join(dataset_path, "frozen_model.pb")
+    with tf.gfile.GFile(model_path, "rb") as f:
+        graph_def = tf.GraphDef()
+        graph_def.ParseFromString(f.read())
+    graph1 = tf.Graph()
+    with graph1.as_default():
+        tf.import_graph_def(graph_def, name='')
+    # list frozen graph ops
+    for op in graph1.get_operations():
+        print(op.name, op.type)
+    # load data
+    mnist = input_data.read_data_sets(dataset_path, one_hot=True)
+    test_mnist = mnist.test.images[5555].reshape([1, -1])
+    test_mnist_label = mnist.test.labels[5555]
+    # test frozen graph
+    x = graph1.get_tensor_by_name('input_image:0')
+    y = graph1.get_tensor_by_name('softmax1/Softmax:0')
+    with tf.Session(graph=graph1) as sess:
+        out = sess.run(y, feed_dict={x: test_mnist})
+        print("test : {}".format(np.argmax(out.flatten(), 0)))
+        print("real : {}".format(np.argmax(test_mnist_label, 0)))
 
 def main(args):
     if FLAGS.mode == 'download':
@@ -194,6 +259,8 @@ def main(args):
         test(os.path.join(os.getcwd(), "mnist"))
     elif FLAGS.mode == 'frozen':
         frozen(os.path.join(os.getcwd(), "mnist"))
+    elif FLAGS.mode == 'test_frozen':
+        test_frozen(os.path.join(os.getcwd(), "mnist"))
     else:
         raise ValueError("not a valid mode: {}!".format(FLAGS.mode))
 
