@@ -226,6 +226,7 @@ def test_frozen(dataset_path):
     Parameters
     ----------
     dataset_path : str
+        input mnist dataset path
     """
     # load freeze model
     model_path = os.path.join(dataset_path, "frozen_model.pb")
